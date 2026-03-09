@@ -427,7 +427,7 @@ def analyze_speed_test(token: str, image_path: str, model_name: str, log_placeho
     try:
         resp = _post_chat_completion(token, payload, timeout=50)
         resp.raise_for_status()
-        content = clean_json_response(resp.json()["choices"][0]["message"]["content"])
+        content = clean_json_response(_extract_model_content(resp))
         res = json.loads(content)
         
         # LOGIC CHECK 1: If the model returns 2160/1080 as speed, it failed the Domain Rule. Reject it.
@@ -477,7 +477,7 @@ def analyze_video_test(token: str, image_path: str, model_name: str, log_placeho
     try:
         resp = _post_chat_completion(token, payload, timeout=50)
         resp.raise_for_status()
-        content = clean_json_response(resp.json()["choices"][0]["message"]["content"])
+        content = clean_json_response(_extract_model_content(resp))
         res = json.loads(content)
         
         if res.get("data", {}).get("max_resolution") is not None or res.get("data", {}).get("load_time_ms") is not None:
@@ -516,7 +516,7 @@ def analyze_voice_test_strict(token: str, image_path: str, model_name: str, log_
     try:
         resp = _post_chat_completion(token, payload, timeout=50)
         resp.raise_for_status()
-        content = clean_json_response(resp.json()["choices"][0]["message"]["content"])
+        content = clean_json_response(_extract_model_content(resp))
         return json.loads(content)
     except Exception:
         return None
