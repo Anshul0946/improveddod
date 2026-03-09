@@ -21,6 +21,23 @@ import streamlit as st
 import openpyxl
 from PIL import Image
 
+# ---------- Robust HTTP client config ----------
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# DEBUG toggle (set True temporarily while debugging)
+HTTP_DEBUG = False
+
+# Tunable network settings
+API_CONNECT_TIMEOUT = 10         # seconds for TCP connect
+API_READ_TIMEOUT = 60            # seconds for server response reading (per request)
+API_MAX_RETRIES = 3              # retry on network errors / 5xx
+API_BACKOFF_FACTOR = 1.0         # exponential backoff factor for Retry
+API_MIN_REQUEST_INTERVAL = 0.15  # minimum seconds between requests (simple rate limit)
+# ------------------------------------------------
+
+
 # ---------------- Configuration ----------------
 API_BASE = "https://integrate.api.nvidia.com/v1"
 MODEL_SERVICE_DEFAULT = "nvidia/nemotron-nano-12b-v2-vl"
@@ -203,9 +220,113 @@ def extract_images_from_excel(xlsx_path: str, output_folder: str, log_placeholde
 
 
 # ---------------- API helpers & analyzers ----------------
+# Global session (create once)
+_SESSION = None
+_LAST_REQUEST_AT = 0.0
+
+def _create_session():
+    s = requests.Session()
+    retry = Retry(
+        total=API_MAX_RETRIES,
+        backoff_factor=API_BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(['GET','POST','PUT','DELETE','OPTIONS','HEAD'])
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20, pool_connections=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
 def _post_chat_completion(token: str, payload: dict, timeout: int = 60):
+    """
+    Robust request helper (streamlit / excel-image pipeline):
+      - uses a single Session (_SESSION) created by _create_session()
+      - uses (connect, read) tuple timeout and honors caller's `timeout`
+      - avoids full json.dumps on giant payloads by estimating payload size (fast)
+      - logs basic telemetry (payload estimate, serialization estimate, elapsed, Retry-After)
+      - returns requests.Response or raises the original requests exception
+    NOTE: This function intentionally DOES NOT modify payload or image bytes.
+    """
+    global _SESSION, _LAST_REQUEST_AT
+
+    # ensure session exists (expects _create_session() defined elsewhere in file)
+    if _SESSION is None:
+        _SESSION = _create_session()
+
     headers = _api_headers(token)
-    return requests.post(url=f"{API_BASE}/chat/completions", headers=headers, data=json.dumps(payload), timeout=timeout)
+
+    # compute timeouts as tuple (connect, read) and honor caller timeout
+    connect_timeout = API_CONNECT_TIMEOUT
+    read_timeout = max(API_READ_TIMEOUT, timeout)  # caller's timeout is respected
+    timeout_tuple = (connect_timeout, read_timeout)
+
+    # very small rate-limit to avoid bursts (streamlit single-user safety)
+    now = time.time()
+    delta = now - (_LAST_REQUEST_AT or 0.0)
+    if delta < API_MIN_REQUEST_INTERVAL:
+        time.sleep(API_MIN_REQUEST_INTERVAL - delta)
+
+    # Lightweight payload size estimator (fast; avoids heavy json.dumps of base64 blobs)
+    def _estimate_payload_size(obj):
+        if obj is None:
+            return 0
+        if isinstance(obj, str):
+            return len(obj)
+        if isinstance(obj, (int, float, bool)):
+            return 8
+        if isinstance(obj, dict):
+            s = 0
+            for k, v in obj.items():
+                if isinstance(k, str):
+                    s += len(k)
+                s += _estimate_payload_size(v)
+            return s
+        if isinstance(obj, (list, tuple)):
+            return sum(_estimate_payload_size(v) for v in obj)
+        return 0
+
+    try:
+        t0 = time.time()
+        payload_bytes = _estimate_payload_size(payload)
+        serial_time = time.time() - t0
+    except Exception:
+        payload_bytes = 0
+        serial_time = 0.0
+
+    # optional debug logging toggle (HTTP_DEBUG constant expected)
+    if HTTP_DEBUG:
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+
+    log_msg = (
+        f"[HTTP] POST {API_BASE}/chat/completions "
+        f"timeout=(connect={connect_timeout},read={read_timeout}) "
+        f"payload_estimate_bytes={payload_bytes} json_estimate_s={serial_time:.3f}"
+    )
+
+    try:
+        t_start = time.time()
+        # Use json=payload (requests will serialize). We deliberately do not pre-serialize payload.
+        resp = _SESSION.post(f"{API_BASE}/chat/completions", headers=headers, json=payload, timeout=timeout_tuple)
+        elapsed = time.time() - t_start
+        _LAST_REQUEST_AT = time.time()
+
+        retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+        logging.info(f"{log_msg} -> status={resp.status_code} elapsed_s={elapsed:.3f} retry_after={retry_after}")
+
+        return resp
+
+    except requests.exceptions.ReadTimeout as e:
+        # upstream code expects exception; we log contextual info and re-raise
+        logging.warning(f"{log_msg} -> ReadTimeout (connect={connect_timeout}, read={read_timeout}): {e}")
+        raise
+    except requests.exceptions.ConnectTimeout as e:
+        logging.warning(f"{log_msg} -> ConnectTimeout: {e}")
+        raise
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"{log_msg} -> RequestException: {e}")
+        raise
+
 
 
 def process_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
